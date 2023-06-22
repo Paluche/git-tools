@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+
+# pylint:disable-next=invalid-name
+
+"""Complete but simplistic git status with color."""
+
+import os
+import sys
+import re
+from datetime import datetime
+from argparse import ArgumentParser, RawDescriptionHelpFormatter
+from subprocess import check_output, CalledProcessError
+from paluche.logging import Color, format_string
+
+# Line                                     Notes
+# ------------------------------------------------------------
+# # branch.oid <commit> | (initial)        Current commit.
+# # branch.head <branch> | (detached)      Current branch.
+# # branch.upstream <upstream_branch>      If upstream is set.
+# # branch.ab +<ahead> -<behind>           If upstream is set and
+#                                          the commit is present.
+# ------------------------------------------------------------
+HASH_FMT = r'[0-9a-f]{40}'
+BRANCH_OID_RE = re.compile(
+                    r'^# branch.oid (?P<commit>(\(initial\))|' + HASH_FMT + ')'
+                )
+BRANCH_HEAD_RE = re.compile(r'^# branch.head (?P<branch>.+)$')
+BRANCH_UPSTREAM_RE = re.compile(r'^# branch.upstream (?P<upstream_branch>.+)$')
+BRANCH_AB_RE = re.compile(r'^# branch.ab \+(?P<ahead>\d+) \-(?P<behind>\d+)$')
+
+# Field       Meaning
+# --------------------------------------------------------
+# <XY>        A 2 character field containing the staged and unstaged XY values
+#             described in the short format, with unchanged indicated by a "."
+#             rather than a space.
+# <sub>       A 4 character field describing the submodule state.
+#             "N..." when the entry is not a submodule.
+#             "S<c><m><u>" when the entry is a submodule.
+#             <c> is "C" if the commit changed; otherwise ".".
+#             <m> is "M" if it has tracked changes; otherwise ".".
+#             <u> is "U" if there are untracked changes; otherwise ".".
+# <mH>        The octal file mode in HEAD.
+# <mI>        The octal file mode in the index.
+# <mW>        The octal file mode in the worktree.
+# <hH>        The object name in HEAD.
+# <hI>        The object name in the index.
+# <X><score>  The rename or copy score (denoting the percentage of similarity
+#             between the source and target of the move (rename) or copy). For
+#             example "R100" or "C75".
+# <path>      The pathname.  In a renamed/copied entry, this is the target
+#             path.
+# <sep>       When the `-z` option is used, the 2 pathnames are separated with
+#             a NUL (ASCII 0x00) byte; otherwise, a tab (ASCII 0x09) byte
+#             separates them.
+# <origPath>  The pathname in the commit at HEAD or in the index. This is only
+#             present in a renamed/copied entry, and tells where the
+#             renamed/copied contents came from.
+XY_FMT = r'(?P<XY>[MADRCUT!\.]{2})'
+SUB_FMT = r'(?P<sub>[SNCMU\.]{4})'
+OCTAL_FILE_MODE_FMT = r'[0-7]{6}'
+M_H_FMT = r'(?P<mH>' + OCTAL_FILE_MODE_FMT + ')'
+M_I_FMT = r'(?P<mI>' + OCTAL_FILE_MODE_FMT + ')'
+M_W_FMT = r'(?P<mW>' + OCTAL_FILE_MODE_FMT + ')'
+M_1_FMT = r'(?P<m1>' + OCTAL_FILE_MODE_FMT + ')'
+M_2_FMT = r'(?P<m2>' + OCTAL_FILE_MODE_FMT + ')'
+M_3_FMT = r'(?P<m3>' + OCTAL_FILE_MODE_FMT + ')'
+H_H_FMT = r'(?P<hH>' + HASH_FMT + ')'
+H_I_FMT = r'(?P<hI>' + HASH_FMT + ')'
+H_1_FMT = r'(?P<h1>' + HASH_FMT + ')'
+H_2_FMT = r'(?P<h2>' + HASH_FMT + ')'
+H_3_FMT = r'(?P<h3>' + HASH_FMT + ')'
+X_SCORE_FMT = r'(?P<x_score>[RC]\d{1,3})'
+PATH_FMT = r'(?P<path>(.+))'
+SEP_FMT = r'\t'  # We will use tabs
+ORIG_PATH_FMT = r'(?P<origPath>(.+))'
+
+# Ordinary changed entries have the following format:
+#   1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
+ORDINARY_CHANGE_RE = re.compile(
+    '^1 ' + XY_FMT + ' ' + SUB_FMT + ' ' + M_H_FMT + ' ' + M_I_FMT + ' ' +
+    M_W_FMT + ' ' + H_H_FMT + ' ' + H_I_FMT + ' ' + PATH_FMT + '$'
+)
+
+# For renamed or copied entries
+#   2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path><sep><origPath>
+RENAME_OR_COPIED_ENTRY_RE = re.compile(
+    '^2 ' + XY_FMT + ' ' + SUB_FMT + ' ' + M_H_FMT + ' ' + M_I_FMT + ' ' +
+    M_W_FMT + ' ' + H_H_FMT + ' ' + H_I_FMT + ' ' + X_SCORE_FMT + ' ' +
+    PATH_FMT + SEP_FMT + ORIG_PATH_FMT + '$'
+)
+
+# For unmerged entries
+#   u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
+UNMERGED_ENTRY_RE = re.compile(
+    '^u ' + XY_FMT + ' ' + SUB_FMT + ' ' + M_1_FMT + ' ' + M_2_FMT + ' ' +
+    M_3_FMT + ' ' + M_W_FMT + ' ' + H_1_FMT + ' ' + H_2_FMT + ' ' + H_3_FMT +
+    ' ' + PATH_FMT + '$'
+)
+
+# Untracked items have the following format:
+#   ? <path>
+UNTRACKED_ITEM_RE = re.compile(r'^\? ' + PATH_FMT + '$')
+
+# Ignored items have the following format:
+#   ! <path>
+
+
+def parse_branch_info(branch_info, entry):
+    """parse_branch_info.
+
+    :param branch_info:  Dictionary to update.
+    :param entry:        Entry to parse.
+    """
+    if entry.startswith('# branch.oid'):
+        match = BRANCH_OID_RE.match(entry)
+    elif entry.startswith('# branch.head'):
+        match = BRANCH_HEAD_RE.match(entry)
+    elif entry.startswith('# branch.upstream'):
+        match = BRANCH_UPSTREAM_RE.match(entry)
+    elif entry.startswith('# branch.ab'):
+        match = BRANCH_AB_RE.match(entry)
+
+    branch_info.update(match.groupdict())
+
+    return 0
+
+
+def generate_branch_info(branch_info):
+    """generate_branch_info.
+
+    :param branch_info:
+    """
+    commit = format_string(branch_info['commit'], fg=Color.YELLOW)
+    branch = format_string(branch_info['branch'], fg=Color.RED)
+
+    msg = f'{commit} -> {branch}'
+
+    if 'ahead' in branch_info:
+        ahead = branch_info['ahead']
+        behind = branch_info['behind']
+
+        msg += format_string(f' {ahead}', fg=Color.GREEN)
+        msg += format_string(f'  {behind}', fg=Color.RED)
+    elif 'upstream_branch' in branch_info:
+        msg += format_string(' ', fg=Color.RED)
+
+    if 'upstream_branch' in branch_info:
+        upstream_branch = branch_info['upstream_branch']
+        msg += format_string(f' {upstream_branch}', fg=Color.CYAN)
+
+    return msg
+
+
+def generate_status_header(xy_field, sub_field, color=None):
+    """Generate the header of a status line,
+
+    :param xy_field: XY status.
+    :param sub_field: Submodule status.
+    :param color: Color to apply to the whole header.
+    """
+    xy_field = xy_field.replace('.', ' ')
+    sub_field = sub_field.replace('.', ' ').replace('N', ' ')
+    x_color = color if color else Color.GREEN
+    y_color = color if color else Color.RED
+    sub_color = color if color else Color.BLUE
+
+    return (
+        format_string(f'{xy_field[0]:1}', fg=x_color) +
+        format_string(f'{xy_field[1]:1}', fg=y_color) +
+        ' ' +
+        format_string(f'{sub_field:4}', fg=sub_color)
+    )
+
+
+def generate_1_or_u(rel_path, match):
+    """Generate output line for entries type '1' or 'u'.
+
+    :param match: Regular expression named element matched.
+    """
+    header = generate_status_header(match.group('XY'), match.group('sub'))
+    path = os.path.join(rel_path, match.group('path'))
+
+    return f'{header} {path}'
+
+
+def parse_ordinary_change_entry(repository_dir, ignore_submodules, rel_path,
+                                entry):
+    """Parse status line for an ordinary change entry."""
+    match = ORDINARY_CHANGE_RE.match(entry)
+
+    if not match:
+        return 1, f'Failed to parse ordinary change entry "{entry}"'
+
+    ret = 0
+    lines = [generate_1_or_u(rel_path, match)]
+
+    if match.group('sub').startswith('S'):
+        rel_path = match.group('path')
+        ret, sub_status = run_git_status(os.path.join(repository_dir,
+                                                      rel_path),
+                                         ignore_submodules,
+                                         rel_path)
+        in_tree = False
+        reversed_lines = []
+        for line in reversed(sub_status):
+            if '─' in line:
+                # Sub-sub-module
+                if not in_tree:
+                    reversed_lines.append(f'           {line}')
+                else:
+                    reversed_lines.append(f'        │  {line}')
+            else:
+                if not in_tree:
+                    reversed_lines.append(f'        └─ {line}')
+                    in_tree = True
+                else:
+                    reversed_lines.append(f'        ├─ {line}')
+
+        lines.extend(reversed(reversed_lines))
+
+    return ret, lines
+
+
+def parse_renamed_or_copied_entry(repository_dir, ignore_submodules, rel_path,
+                                  entry):
+    """Parse status line for a renamed or copied entry."""
+    _ = repository_dir
+    _ = ignore_submodules
+    match = RENAME_OR_COPIED_ENTRY_RE.match(entry)
+
+    if not match:
+        return 1, f'Failed to parse renamed or copied entry "{entry}"'
+
+    match = match.groupdict()
+
+    header = generate_status_header(match['XY'], match['sub'])
+    origin_path = os.path.join(rel_path, match['origPath'])
+    path = os.path.join(rel_path, match['path'])
+
+    if match['x_score'][0] == 'R':
+        ret = f'{header} {origin_path} -> {path}'
+    else:
+        ret = f'{header}{path} copied from {origin_path}'
+
+    return 0, [ret]
+
+
+def parse_unmerged_entry(repository_dir, ignore_submodules, rel_path, entry):
+    """Parse status line for an unmerged entry."""
+    _ = repository_dir
+    _ = ignore_submodules
+    match = UNMERGED_ENTRY_RE.match(entry)
+
+    if not match:
+        return 1, [f'Failed to parse unmerged entry "{entry}"']
+
+    return 0, [generate_1_or_u(rel_path, match)]
+
+
+def parse_untracked_item(repository_dir, ignore_submodules, rel_path, entry):
+    """Parse status line for an untracked item."""
+    _ = repository_dir
+    _ = ignore_submodules
+    match = UNTRACKED_ITEM_RE.match(entry)
+
+    if not match:
+        return 1, [f'Failed to parse untracked entry "{entry}"']
+
+    header = generate_status_header('??', '????', color=Color.CYAN)
+    path = os.path.join(rel_path, match.group('path'))
+
+    return 0, [f'{header} {path}']
+
+
+def parse_ignored_item(repository_dir, ignore_submodules, rel_path, entry):
+    """Parse status line for an ignored item."""
+    _ = repository_dir
+    _ = ignore_submodules
+    match = UNTRACKED_ITEM_RE.match(entry)
+
+    if not match:
+        return 1, [f'Failed to parse untracked entry "{entry}"']
+
+    header = generate_status_header('!!', '!!!!', color=Color.CYAN)
+    path = os.path.join(rel_path, match.group('path'))
+
+    return 0, [f'{header} {path}']
+
+
+PARSERS = {
+    '1': parse_ordinary_change_entry,
+    '2': parse_renamed_or_copied_entry,
+    'u': parse_unmerged_entry,
+    '?': parse_untracked_item,
+    '!': parse_ignored_item,
+}
+
+
+def run_git_status(repository_dir, ignore_submodules, rel_path):
+    """Run the git status command line."""
+    cmd = ['git',
+           '-C',
+           repository_dir,
+           'status',
+           '--porcelain=v2',
+           '--branch']
+
+    if ignore_submodules:
+        cmd.append(f'--ignore-submodules={ignore_submodules}')
+
+    try:
+        status = check_output(cmd, encoding='utf-8').rstrip().split('\n')
+    except CalledProcessError as called_process_error:
+        # Silently exit
+        return called_process_error.returncode, []
+
+    ret = 0
+    output = []
+
+    fetch_head = os.path.join(repository_dir, '.git', 'FETCH_HEAD')
+
+    if os.path.isfile(fetch_head):
+        fetch_time = datetime.fromtimestamp(
+                         os.path.getmtime('.git/FETCH_HEAD')
+                     ).ctime()
+        output.append(
+            format_string(f'Last fetched: {fetch_time}', fg=Color.GREEN)
+        )
+
+    branch_info = {}
+
+    for entry in status:
+        entry_type = entry[0]
+
+        if entry_type == '#':
+            parse_branch_info(branch_info, entry)
+            continue
+
+        # Do not print the branch info for the submodule status. We can know we
+        # are in a submodule if the rel_path is not an empty string.
+        if branch_info and not rel_path:
+            output.append(generate_branch_info(branch_info))
+            branch_info = None
+
+        try:
+            ret_, lines = PARSERS[entry_type](repository_dir,
+                                              ignore_submodules,
+                                              rel_path,
+                                              entry)
+            ret |= ret_
+        except KeyError:
+            print(f'Unknown entry type "{entry_type}"')
+            return 1, output
+
+        output.extend(lines)
+
+    if branch_info and not rel_path:
+        output.append(generate_branch_info(branch_info))
+
+    return ret, output
+
+
+# Main entry point.
+
+
+def _main():
+    parser = ArgumentParser(formatter_class=RawDescriptionHelpFormatter,
+                            description=__doc__)
+    parser.add_argument(
+        '-C',
+        dest='repository_dir',
+        metavar='<path>',
+        default=os.getcwd(),
+        help='Run as if git_status was started in <path> instead of the '
+             'current working directory.'
+    )
+
+    parser.add_argument(
+        '--ignore-submodules',
+        dest='ignore_submodules',
+        choices=['', 'none', 'untracked', 'dirty', 'all'],
+        metavar='<when>',
+        help='Ignore changes to submodules when looking for changes. <when> '
+             'can be either "none", "untracked", "dirty" or "all", which is '
+             'the default. Using "none" will consider the submodule modified '
+             'when it either contains untracked or modified files or its HEAD '
+             'differs from the commit recorded in the superproject and can be '
+             'used to override any settings of the ignore option in '
+             'git-config(1) or gitmodules(5). When "untracked" is used '
+             'submodules are not considered dirty when they only contain '
+             'untracked content (but they are still scanned for modified '
+             'content). Using "dirty" ignores all changes to the work tree of '
+             'submodules, only changes to the commits stored in the '
+             'superproject are shown (this was the behavior before 1.7.0). '
+             'Using "all" hides all changes to submodules (and suppresses the '
+             'output of submodule summaries when the config option '
+             'status.submoduleSummary is set).'
+    )
+
+    # Parse the arguments.
+    parsed = parser.parse_args()
+    ret, output = run_git_status(parsed.repository_dir,
+                                 parsed.ignore_submodules,
+                                 '')
+
+    print('\n'.join(output))
+    return ret
+
+
+if __name__ == "__main__":
+    sys.exit(_main())

@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+
+# pylint:disable-next=invalid-name
+
+"""Smart tool to remove git branches.
+
+By default it removes any local branch which remote is now gone.
+"""
+
+import sys
+import os
+from argparse import (ArgumentParser,
+                      RawDescriptionHelpFormatter,
+                      Action,
+                      SUPPRESS)
+from subprocess import check_call
+from pygit2 import Repository, GitError
+from paluche.logging import print_format, Color
+from paluche.git import (get_local_branch_name,
+                         is_branch_remote,
+                         get_remote_name)
+
+
+def delete_remote_branches(repository, branches):
+    """Delete remote branches.
+
+    :param repository: Repository instance corresponding to the repository
+                       from which to remove the branches.
+    :type repository: pygit2.Repository
+    :param branches: Branches to delete.
+    :type branch: list(pygit2.Branch)
+    """
+
+    # Sort the branch by remote.
+    to_delete = {}
+
+    for branch in branches:
+        if branch.remote_name not in to_delete:
+            to_delete[branch.remote_name] = []
+
+        to_delete[branch.remote_name].append(get_local_branch_name(branch))
+
+    for remote_name, branch_names in to_delete.items():
+        print_format(
+            'Deleting remote branch' +
+            ('es' if len(branch_names) > 1 else '') + ':',
+            ', '.join(branch_names),
+            f'from {remote_name}',
+            fg=Color.YELLOW,
+            bold=True
+        )
+
+        check_call(
+            [
+                'git',
+                '-C', repository.workdir,
+                'push',
+                '--delete',
+                remote_name,
+                *branch_names
+            ]
+        )
+
+
+def delete_local_branches(repository, branches, default_branch):
+    """Delete a local branch.
+
+    :param repository: Repository instance corresponding to the repository
+                       from which to remove the branches.
+    :type repository: pygit2.Repository
+    :param branches: Branch to delete.
+    :type branches: pygit2.Branch
+    :param default_branch: Default branch
+    :type default_branch: pygit2.Branch
+    """
+    for branch in branches:
+        if branch.is_head():
+            # The branch is the current HEAD so we need to checkout outside
+            # that reference.
+            if not default_branch:
+                print(f'Unable to delete {branch.branch_name} as it is the '
+                      'current HEAD', file=sys.stderr)
+                return
+
+            try:
+                repository.checkout(default_branch)
+            except GitError as git_error:
+                print_format(
+                    f'Unable to delete {branch.branch_name} as it is the '
+                    f'current HEAD and {git_error:s}.',
+                    fg=Color.RED,
+                    bold=True,
+                    file=sys.stderr
+                )
+                return
+
+            print_format(
+                f'Checkout to {default_branch.branch_name}',
+                fg=Color.YELLOW,
+                bold=True
+            )
+
+        print_format(
+            f'Deleting local branch: {branch.branch_name}',
+            fg=Color.YELLOW,
+            bold=True
+        )
+        branch.delete()
+
+
+def remove_branches(repository, branch_names):
+    """Remove the specified branches. If the branch is a remote one, remove the
+    remote and the associated local branch if it exists.
+
+    :param repository: Repository instance corresponding to the repository
+                       from which to remove the branches.
+    :type repository: pygit2.Repository
+    :param branch_names: List of branch name to remove.
+    :type branch_names: list(str)
+    """
+    remote_to_delete = []
+    local_to_delete = []
+
+    for branch_name in branch_names:
+        try:
+            branch = repository.branches[branch_name]
+        except KeyError:
+            print(f'No match for branch name {branch_name}', file=sys.stderr)
+            continue
+
+        if is_branch_remote(branch):
+            remote_to_delete.append(branch)
+
+            # Delete also local one.
+            try:
+                branch = repository.branches[get_local_branch_name(branch)]
+            except KeyError:
+                # No local.
+                continue
+
+        local_to_delete.append(branch)
+
+    if remote_to_delete:
+        delete_remote_branches(repository, remote_to_delete)
+
+    if local_to_delete:
+        # Search for the default branch.
+        for branch_name in repository.branches.local:
+            if branch_name in ('master', 'main'):
+                default_branch = repository.branches[branch_name]
+                break
+
+        delete_local_branches(repository, local_to_delete, default_branch)
+
+
+def remove_gone_branches(repository):
+    """Remove any local branch which remote has disappeared.
+
+    :param repository: Repository instance corresponding to the repository
+                       from which to remove the branches.
+    :type repository: pygit2.Repository
+    """
+
+    remote_names = tuple(x.name for x in repository.remotes)
+    to_delete = []
+    default_branch = None
+
+    # List local branches to delete and search for the default branch.
+    for branch_name in repository.branches.local:
+        if branch_name.startswith(remote_names):
+            continue
+
+        branch = repository.branches[branch_name]
+
+        if not default_branch:
+            if branch_name in ('master', 'main'):
+                default_branch = branch
+
+        try:
+            branch.upstream_name
+        except KeyError:
+            # Branch never had any upstream set.
+            continue
+
+        if branch.upstream:
+            # Branch currently have a local upstream
+            continue
+
+        to_delete.append(branch)
+
+    delete_local_branches(repository, to_delete, default_branch)
+
+
+# pylint:disable-next=too-few-public-methods
+class ListBranchesAction(Action):
+    """Argument parser action to list all the branches from the local
+    repository.
+    """
+    def __init__(self, option_strings, dest=SUPPRESS, default=SUPPRESS,
+                 # pylint:disable-next=redefined-builtin
+                 help=None):
+        super().__init__(option_strings=option_strings,
+                         dest=dest,
+                         default=default,
+                         nargs=0,
+                         help=help)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        local_branches = set()
+        remote_branches = set()
+
+        print(option_string)
+
+        repository = Repository(namespace.repo_path)
+
+        for branch_name in repository.branches:
+            if branch_name == 'HEAD':
+                continue
+
+            branch = repository.branches[branch_name]
+            remote_name = get_remote_name(branch)
+
+            if remote_name:
+                remote_branches.add(branch.branch_name)
+                local_branches.add(get_local_branch_name(branch))
+            else:
+                local_branches.add(branch.branch_name)
+
+        branches = []
+
+        if option_string != '--list-remote-branches':
+            branches.extend(local_branches)
+        elif option_string != '--list-local-branches':
+            branches.extend(remote_branches)
+
+        print(' '.join(branches))
+
+
+def __main__():
+    parser = ArgumentParser(formatter_class=RawDescriptionHelpFormatter,
+                            description=__doc__)
+
+    parser.register('action', 'list-branches', ListBranchesAction)
+
+    parser.add_argument(
+        dest='branches',
+        nargs='*',
+        help='Name of the branch to delete. If not specified then the local '
+             'branches which remote is now gone will be removed.'
+    )
+
+    parser.add_argument(
+        '-C',
+        dest='repo_path',
+        default=os.getcwd(),
+        help='Run as if git was started in given path.'
+    )
+
+    parser.add_argument(
+        '--list-branches',
+        action='list-branches',
+        default=SUPPRESS,
+        help='List all the branches of the repository.'
+    )
+
+    parser.add_argument(
+        '--list-local-branches',
+        action='list-branches',
+        default=SUPPRESS,
+        help='List all the local branches of the repository.'
+    )
+
+    parser.add_argument(
+        '--list-remote-branches',
+        action='list-branches',
+        default=SUPPRESS,
+        help='List all the remote branches of the repository.'
+    )
+
+    parsed = parser.parse_args()
+
+    repository = Repository(parsed.repo_path)
+
+    if parsed.branches:
+        remove_branches(repository, parsed.branches)
+    else:
+        remove_gone_branches(repository)
+
+
+# Main entry point.
+if __name__ == '__main__':
+    __main__()
