@@ -1,0 +1,50 @@
+# Template file for the tools provided by the git-tools repository.
+# For the color settings choose between: BLACK, RED, GREEN, YELLOW, BLUE,
+# MAGENTA, CYAN or WHITE.
+
+# Configuration for the git-branch-status executable.
+[git-branch-status]
+
+  # Specify a pattern that would identify your branches. This is meant for
+  # repositories where each branch is named based on the developer which is the
+  # author like the identifier of the author is a remote name. For instance you
+  # name your branches "my-name/my-feature" then set this value to my-name.
+  branch-owner=
+  my-branches-color=BLUE
+
+  # Specify the color to use to print the name of the default branch.
+  default-branch-color=YELLOW
+
+  # Specify the color the name of the branch (which are not yours nor the default
+  # branch).
+  branches-color=MAGENTA
+
+  # Specify the characters to use to print the branch status in a table.
+  # Here are the configuration for a NERD font.
+  corner-high-left=┌
+  corner-high-right=┐
+  corner-low-left=└
+  corner-low-right=┘
+  cross-high=┬
+  cross-middle=┼
+  cross-low=┴
+  cross-left=├
+  cross-right=┤
+  line-horizontal=─
+  line-vertical=│
+
+  # Specify the character to use to indicate which is the current branch we are
+  # at.
+  cursor=*
+
+  # Specify the character to use to indicate the branch is rebased on the default
+  # branch. Leave the setting empty if you do not want to have this information
+  # printed.
+  rebased=✔
+  not-rebased=
+
+  # Specify the text illustrating the fact that a branch is ahead/ behind its
+  # remote.
+  ahead=
+  behind=
+  up-to-date=✔

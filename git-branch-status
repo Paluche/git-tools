@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+
+# pylint:disable=invalid-name
+
+"""Nice looking listing of branches present on a repository. """
+
+import sys
+import os
+import struct
+from argparse import ArgumentParser, RawDescriptionHelpFormatter
+from pygit2 import Repository, GitError
+from paluche.logging import Color, format_string
+from paluche.git import (get_local_branch_name,
+                         get_remote_name,
+                         is_rebased_on,
+                         DEFAULT_BRANCH_NAMES)
+from paluche.config import load_git_config_rc
+if sys.platform in ('linux', 'darwin'):
+    import fcntl
+    import termios
+
+
+class Table():
+    """Class to help with formatting the table we will print."""
+    def __init__(self, context, titles=False, inter_outline=False):
+        self.corner_high_left = context.config['corner-high-left']
+        self.corner_high_right = context.config['corner-high-right']
+        self.corner_low_left = context.config['corner-low-left']
+        self.corner_low_right = context.config['corner-low-right']
+        self.cross_high = context.config['cross-high']
+        self.cross_middle = context.config['cross-middle']
+        self.cross_low = context.config['cross-low']
+        self.cross_left = context.config['cross-left']
+        self.cross_right = context.config['cross-right']
+        self.line_horizontal = context.config['line-horizontal']
+        self.line_vertical = context.config['line-vertical']
+        self.do_titles = titles
+        self.do_inter_outline = inter_outline
+        self.titles = [
+            'Local',
+            'Rebased',
+            'Ahead',
+            'Behind',
+            'Remote',
+        ]
+
+        self.lines = []
+
+        self.positions = [
+            '<',  # local_name, aligned on the left.
+            '^',  # rebased_on, centered
+            '^',  # ahead, centered
+            '^',  # behind, centered
+            '<',  # remote_name, aligned on the left.
+        ]
+
+        self.widths = [(len(x) if titles else 0) for x in self.titles]
+
+        # Retrieve current screen width.
+        if sys.platform in ('linux', 'darwin'):
+            ioctl_fd = sys.stdout.fileno()
+            if os.isatty(ioctl_fd):
+                try:
+                    data = fcntl.ioctl(ioctl_fd, termios.TIOCGWINSZ, '1234')
+                    _, self.screen_width = struct.unpack('hh', data)
+                except OSError:
+                    self.screen_width = 99999999999
+
+    def add_line(self, current_branch, *args):
+        """Add a line in the table.
+
+        :param current_branch: Boolean indicating if the branch if the current
+                               one.
+        :type current_branch: bool
+        :param *args: Cells content of the line.
+        :type *args: tuple(str)
+        """
+        # Compute the width of the cells.
+        for i, arg in enumerate(args[:len(self.titles)]):
+            self.widths[i] = max(self.widths[i], len(arg))
+
+        while self.width() > self.screen_width:
+            # Find the bigger field
+            i = self.widths.index(max(self.widths))
+            # Truncate this field.
+            self.widths[i] -= 1
+
+        self.lines.append(
+            (
+                '*' if current_branch else ' ',
+                *args
+            )
+        )
+
+    def width(self):
+        """Return the current width of the line."""
+        return len(self.get_outline(' ', ' ', ' '))
+
+    def get_outline(self, start, inter, end):
+        """Get the string representing a line outlining the table."""
+        inter = f'{self.line_horizontal}{inter}{self.line_horizontal}'
+        middle = inter.join((self.line_horizontal * width)
+                            for width in self.widths)
+        return (f' {start}{self.line_horizontal}{middle}'
+                f'{self.line_horizontal}{end}')
+
+    def print_start_outline(self):
+        """Print the start outline of the table."""
+        print(self.get_outline(self.corner_high_left,
+                               self.cross_high,
+                               self.corner_high_right))
+
+    def print_inter_outline(self):
+        """Print a intermediate outline of the table. Separating two line of
+        the table.
+        """
+        print(self.get_outline(self.cross_left,
+                               self.cross_middle,
+                               self.cross_right))
+
+    def print_end_outline(self):
+        """Print the end outline of the table."""
+        print(self.get_outline(self.corner_low_left,
+                               self.cross_low,
+                               self.corner_low_right))
+
+    def format_cell(self, value, position, width, color):
+        """Format a cell from the table.
+
+        :param value: Value to print.
+        :type value: str
+        :param position: How the text should be positioned in the cell.
+        :type position: str
+        :param width: Width of the cell.
+        :type width: int
+        :param color: Color the text of the cell.
+        :type color: Color
+
+        :return: String being the content of a cell.
+        :rtype: str
+        """
+        if len(value) > width:
+            value = value[:width - 4] + ' ...'
+
+        return format_string(f'{value:{position}{width}}', fg=color)
+
+    def print_titles(self):
+        """Print the titles line."""
+        self.print_line(' ', *self.titles, *([None] * len(self.titles)))
+
+    def print_line(self, current_branch, *args):
+        """Print a line of the table."""
+        values = args[:len(self.titles)]
+        colors = args[len(self.titles):]
+
+        print(
+            f'{current_branch}{self.line_vertical}',
+            f' {self.line_vertical} '.join(
+                self.format_cell(
+                    value,
+                    self.positions[i],
+                    self.widths[i],
+                    colors[i]
+                )
+                for i, value in enumerate(values)
+            ),
+            f'{self.line_vertical}'
+        )
+
+    def print(self):
+        """Print the table."""
+        self.print_start_outline()
+
+        if self.do_titles:
+            self.print_titles()
+            if self.do_inter_outline:
+                self.print_inter_outline()
+
+        for line in self.lines[:-1]:
+            self.print_line(*line)
+            if self.do_inter_outline:
+                self.print_inter_outline()
+
+        self.print_line(*self.lines[-1])
+
+        self.print_end_outline()
+
+
+# pylint:disable-next=too-few-public-methods
+class Context():
+    """Script context."""
+    def __init__(self, args):
+        self.config = load_git_config_rc()['git-branch-status']
+        self.repository = Repository(args.repo_path)
+        self.default_branch, self.branches = self.__list_branches()
+
+    def __list_branches(self):
+        """List all branches from a repository.
+
+        :param repository: Repository instance corresponding to the repository
+                           from which list the branches.
+        :type repository: pygit2.Repository
+
+        :return: Tuple of two elements:
+                 - Branch instance corresponding to the default branch (e.g.
+                   master)
+                 - Dictionary listing the branches on the current repository.
+                   {branch_name: (has_local, remote name)}
+                   branch_name: str, Name of the branch.
+                   has_local: bool, Boolean indicating if the branch exists as
+                              local.
+                   remote_name: str, Name of the remote the branch exists on. If
+                                None it means there is no remote for that branch.
+        :rtype: tuple(pygit2.Branch,
+                      dict(str: tuple(pygit2.Branch, pygit2.Branch)))
+        """
+        default_branch = None
+        branches = {
+            # branch_name: (has_local, remote name)
+        }
+
+        for branch_name in self.repository.branches:
+            branch = self.repository.branches[branch_name]
+            remote_name = get_remote_name(branch)
+
+            if remote_name:
+                branch_name = get_local_branch_name(branch)
+                local_branch = None
+                remote_branch = branch
+            else:
+                branch_name = branch.branch_name
+                local_branch = branch
+                remote_branch = None
+
+            if branch_name == 'HEAD':
+                continue
+
+            if (not default_branch and
+                    remote_name and
+                    branch_name in DEFAULT_BRANCH_NAMES):
+                default_branch = branch
+
+            if branch_name in branches:
+                # Update the branch status.
+                local_branch_, remote_branch_ = branches[branch_name]
+
+                local_branch = local_branch or local_branch_
+                remote_branch = remote_branch or remote_branch_
+
+            branches[branch_name] = (local_branch, remote_branch)
+
+        return default_branch, branches
+
+    @property
+    def branch_owner(self):
+        return self.config['branch-owner']
+
+    @property
+    def my_branches(self, all_):
+        if not self.branch_owner:
+            raise RuntimeError(
+                'Option not available if "my-branches" setting is not set '
+                'in the git_tools_rc file'
+            )
+
+        return {
+            branch_name: (has_local, remote_name)
+            for branch_name, (has_local, remote_name) in self.branches.items()
+            if (branch_name.startswith(f'{self.branch_owner}/') and
+                (all_ or has_local))
+        }
+
+    def local_branches(self):
+        return {
+            branch_name: (has_local, remote_name)
+            for branch_name, (has_local, remote_name) in self.branches.items()
+            if has_local
+        }
+
+
+def get_rebased_on_text(context, reference):
+    """Get the text and color to print to indicating if a specific reference is
+    rebased on top of a specific target reference.
+
+    :param context: Script context.
+    :type context: Context
+    :param reference: Git reference you want to know if it is rebased on
+                      target.
+    :type reference: str
+
+    :return: Tuple of two elements: The text to print and the color into which
+    :rtype: bool
+    """
+
+    rebased = is_rebased_on(context.repository,
+                            reference,
+                            context.default_branch.target)
+
+    if rebased:
+        return (context.config['rebased'], Color.GREEN)
+
+    return (context.config['not_rebased'], Color.RED)
+
+
+
+def local_branch_has_upstream(local_branch):
+    """Find out if a local branch has an upstream linked to.
+
+    :param local_branch: Branch you want to know if there is an upstream linked
+                         to.
+    :type local_branch: pygit2.Branch
+
+    :return: True if the local branch has an upstrean linker to it, False
+             otherwise.
+    :rtype: bool
+    """
+    try:
+        # pylint:disable-next=pointless-statement
+        local_branch.upstream_name
+        return True
+    except KeyError:
+        return False
+
+
+# pylint: disable-next=too-many-locals, too-many-branches, too-many-statements
+def print_branches(context, branches):
+    """Print the status of the provided branches.
+    """
+    if not branches:
+        return
+
+    table = Table()
+
+    my_branches = context.config
+
+
+    # Compute fields value, color and width.
+    for branch_name, (local_branch, remote_branch) in sorted(
+        branches.items(), key=lambda x: x[0]
+    ):
+        current_branch = branch_name == context.repository.head.shorthand
+
+        if remote_branch and \
+                remote_branch.branch_name == context.default_branch.branch_name:
+            branch_color = Color.YELLOW
+        else:
+            owner, *title = branch_name.split('/', maxsplit=1)
+
+            if not title or owner == 'hle':
+                branch_color = Color.BLUE
+            else:
+                branch_color = Color.MAGENTA
+
+        if local_branch:
+            local_name = local_branch.branch_name
+            local_name_color = branch_color
+
+            rebased_on, rebased_on_color = get_rebased_on_text(
+                context,
+                local_branch.target
+            )
+        else:
+            local_name = '(no local)'
+            local_name_color = Color.CYAN
+            if remote_branch:
+                rebased_on, rebased_on_color = get_rebased_on_text(
+                    context,
+                    remote_branch.target
+                )
+            else:
+                rebased_on = 'n/a'
+                rebased_on_color = Color.WHITE
+
+        if local_branch and remote_branch:
+            ahead, behind = context.repository.ahead_behind(
+                                local_branch.target,
+                                remote_branch.target
+                            )
+            if ahead:
+                ahead = f'{ahead} '
+                ahead_color = Color.RED
+            else:
+                ahead = '✔'
+                ahead_color = Color.GREEN
+
+            if behind:
+                behind = f'{behind} '
+                behind_color = Color.RED
+            else:
+                behind = '✔'
+                behind_color = Color.GREEN
+
+        else:
+            ahead = 'n/a'
+            ahead_color = Color.WHITE
+            behind = 'n/a'
+            behind_color = Color.WHITE
+
+        if remote_branch:
+            remote_name = remote_branch.branch_name
+            remote_name_color = branch_color
+        elif local_branch_has_upstream(local_branch):
+            remote_name = '(gone)'
+            remote_name_color = Color.RED
+        else:
+            remote_name = '(no upstream)'
+            remote_name_color = Color.CYAN
+
+        # Compute maximum columns width.
+        table.add_line(current_branch,
+                       local_name,
+                       rebased_on,
+                       ahead,
+                       behind,
+                       remote_name,
+                       local_name_color,
+                       rebased_on_color,
+                       ahead_color,
+                       behind_color,
+                       remote_name_color)
+
+    table.print()
+
+
+def __main__():
+    parser = ArgumentParser(formatter_class=RawDescriptionHelpFormatter,
+                            description=__doc__)
+
+    parser.add_argument(
+        '-C',
+        dest='repo_path',
+        default=os.getcwd(),
+        help='Run as if git was started in given path.'
+    )
+
+    parser.add_argument(
+        '--mine',
+        action='store_true',
+        help='Show only my branches. Available only if the settings '
+             '"my-branches" is set in the git_tools_rc file.'
+    )
+
+    parser.add_argument(
+        '--all', '-a',
+        dest='all',
+        action='store_true',
+        help='List all the branches. By default only the local ones are '
+             'listed.'
+    )
+
+    args = parser.parse_args()
+
+    try:
+        context = Context(args)
+    except GitError as git_error:
+        print(git_error)
+        return 1
+
+    if args.mine:
+        print_branches(context, context.my_branches)
+    elif args.all:
+        print_branches(context, context.branches)
+    else:
+        # Print only the local ones
+        print_branches(context, context.local_branches)
+
+    return 0
+
+
+# Main entry point.
+if __name__ == '__main__':
+    sys.exit(__main__())
