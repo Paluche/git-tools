@@ -1,0 +1,17 @@
+# silversearch-ag ignore files
+.agignore
+
+# VIM temporary files
+*.swp
+*.swo
+
+# Emacs temporary files
+*~
+*#
+
+# Python cache folders
+__pycache__
+
+# Pip temporary folders
+build
+dist
